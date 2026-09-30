@@ -687,8 +687,9 @@ function importText(txt){
     if(m&&+m[1]<=63999) setLine(+m[1],crunch(m[2]));
   }
   clearVars(); contPos=null; kq.length=0; kbd=0;
-  if(CH) outChar(13);
-  outStr(prog.length+' ZEILEN GELADEN'); showPrompt();
+  sText=true; sMixed=sHires=sPage2=false; WTOP=0; WBOT=24; invMode=0;
+  home();
+  listQ=prog.map(l=>l.n+' '+detok(l.t)); listAcc=1; mode='list';   // Programm gleich anzeigen (wie LIST)
 }
 
 // ---------- Takt: ein Bildschirm-Frame ----------
