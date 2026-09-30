@@ -1,0 +1,834 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Apple ][ BASIC</title>
+<style>
+:root{color-scheme:dark}
+html,body{margin:0;background:#0d0d0c;color:#ccc;font-family:-apple-system,system-ui,sans-serif;touch-action:manipulation;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+#wrap{display:flex;flex-direction:column;align-items:center;padding:20px 16px;box-sizing:border-box}
+#crt{position:relative;width:100%;width:min(100%,calc((100dvh - 120px) * 4 / 3));aspect-ratio:4/3;background:radial-gradient(ellipse at center,#0b2112 0%,#030904 78%);border-radius:22px;overflow:hidden;box-shadow:inset 0 0 50px rgba(0,0,0,.9),0 0 0 10px #1b1b19,0 0 0 12px #2c2c28}
+#screen{position:absolute;left:5%;top:5%;width:90%;height:90%;image-rendering:pixelated;image-rendering:crisp-edges;filter:drop-shadow(0 0 1.5px rgba(90,255,140,.9)) drop-shadow(0 0 6px rgba(60,255,110,.35))}
+#crt::after{content:'';position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(to bottom,rgba(0,0,0,.28) 0,rgba(0,0,0,.28) 1px,transparent 1px,transparent 3px),radial-gradient(ellipse at center,transparent 58%,rgba(0,0,0,.6) 100%)}
+#bar{display:flex;gap:8px;margin-top:22px;width:100%;max-width:960px}
+#bar button{flex:1 1 0;padding:12px 6px;font-size:15px;background:#222220;color:#9fd8a8;border:1px solid #3a3a36;border-radius:8px;font-family:inherit}
+#bar button:active{background:#3a3a36}
+#reset{color:#f08a80!important}
+#kb{position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;font-size:16px;border:0;padding:0;margin:0}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="crt"><canvas id="screen" width="280" height="192"></canvas></div>
+  <div id="bar">
+    <button id="reset">RESET</button>
+    <button data-k="3">CTRL-C</button>
+    <button data-k="8">←</button>
+    <button data-k="21">→</button>
+  </div>
+</div>
+<input id="kb" type="text" value=" " autocapitalize="characters" autocomplete="off" autocorrect="off" spellcheck="false">
+
+<!-- ===== Kern: Applesoft-BASIC-Interpreter + Apple-II-Speicher (ohne DOM) ===== -->
+<script id="core">
+'use strict';
+const CLK=1020484, STMT=700;               // Takt, ~Zyklen pro BASIC-Anweisung (≈ Originaltempo)
+const mem=new Uint8Array(65536);
+let kbd=0; const kq=[];
+let sText=true,sMixed=false,sPage2=false,sHires=false;
+let CH=0,CV=0,WTOP=0,WBOT=24,invMode=0,charDelay=0,hpage=0x2000,hcolor=3,lcolor=0,hx=0,hy=0;
+let tnow=0,sub=0,extraCyc=0; const toggles=[];
+
+// ---------- Tastatur-Latch ($C000/$C010) ----------
+function key(c){
+  c&=0x7F; if(c>=0x60) c-=0x20;
+  if(!(kbd&0x80)) kbd=c|0x80; else if(kq.length<256) kq.push(c);
+}
+function clearStrobe(){ kbd&=0x7F; if(kq.length) kbd=kq.shift()|0x80; }
+
+// ---------- Ton ----------
+function toggle(){ toggles.push(tnow+sub); sub+=40; }
+function bell(){ for(let i=0;i<200;i++) toggles.push(tnow+sub+i*510); sub+=102000; extraCyc+=102000; }
+
+// ---------- Textausgabe ----------
+const taddr=r=>0x400+((r&7)<<7)+(r>>3)*40;
+const haddr=y=>((y&7)<<10)+(((y>>3)&7)<<7)+(y>>6)*40;
+function scroll(){
+  for(let r=WTOP;r<WBOT-1;r++){ const s=taddr(r+1); mem.copyWithin(taddr(r),s,s+40); }
+  const a=taddr(WBOT-1); mem.fill(0xA0,a,a+40);
+}
+function lf(){ if(++CV>=WBOT){ CV=WBOT-1; scroll(); } }
+function outChar(c){
+  c&=0x7F;
+  if(c===13){ CH=0; lf(); return; }
+  if(c===7){ bell(); return; }
+  if(c===8){ if(CH>0) CH--; return; }
+  if(c===10){ lf(); return; }
+  if(c<32) return;
+  if(c>=0x60) c-=0x20;
+  mem[taddr(CV)+CH]= invMode===0 ? c|0x80 : invMode===1 ? c&0x3F : (c&0x3F)|0x40;
+  extraCyc+=charDelay;
+  if(++CH>=40){ CH=0; lf(); }
+}
+function outStr(s){ for(let i=0;i<s.length;i++) outChar(s.charCodeAt(i)); }
+function home(){ for(let r=WTOP;r<WBOT;r++) mem.fill(0xA0,taddr(r),taddr(r)+40); CH=0; CV=WTOP; }
+function clrEOL(){ const a=taddr(CV); mem.fill(0xA0,a+CH,a+40); }
+function clrEOS(){ clrEOL(); for(let r=CV+1;r<WBOT;r++) mem.fill(0xA0,taddr(r),taddr(r)+40); }
+
+// ---------- Grafik ----------
+function lplot(x,y){ const a=taddr(y>>1)+x; mem[a]=(y&1)?(mem[a]&0x0F)|(lcolor<<4):(mem[a]&0xF0)|lcolor; }
+function lget(x,y){ const b=mem[taddr(y>>1)+x]; return (y&1)?b>>4:b&15; }
+const HCOL=[[0,0],[0x2A,0x55],[0x55,0x2A],[0x7F,0x7F],[0x80,0x80],[0xAA,0xD5],[0xD5,0xAA],[0xFF,0xFF]];
+function hplot(x,y){
+  const c=(x/7)|0, bit=x-c*7, a=hpage+haddr(y)+c, cb=HCOL[hcolor][c&1];
+  let b=mem[a]; b=((cb>>bit)&1)?b|(1<<bit):b&~(1<<bit); mem[a]=(b&0x7F)|(cb&0x80);
+}
+function hline(x0,y0,x1,y1){
+  const dx=Math.abs(x1-x0),sx=x0<x1?1:-1,dy=-Math.abs(y1-y0),sy=y0<y1?1:-1; let e=dx+dy;
+  for(;;){ hplot(x0,y0); if(x0===x1&&y0===y1) break; const e2=2*e; if(e2>=dy){e+=dy;x0+=sx;} if(e2<=dx){e+=dx;y0+=sy;} }
+}
+function sw(n){
+  switch(n){ case 0:sText=false;break; case 1:sText=true;break; case 2:sMixed=false;break; case 3:sMixed=true;break;
+             case 4:sPage2=false;break; case 5:sPage2=true;break; case 6:sHires=false;break; case 7:sHires=true;break; }
+}
+
+// ---------- PEEK / POKE ----------
+function peekMem(a){
+  if(a>=0xC000&&a<0xC100){
+    const s=a&0xF0;
+    if(s===0x00) return kbd;
+    if(s===0x10){ const v=kbd&0x7F; clearStrobe(); return v; }
+    if(s===0x30){ toggle(); return 0; }
+    if(s===0x50){ sw(a&15); return 0; }
+    return 0;
+  }
+  switch(a){ case 34:return WTOP; case 35:return WBOT; case 36:return CH; case 37:return CV;
+             case 50:return invMode===1?0x3F:invMode===2?0x7F:0xFF; case 230:return hpage>>8; }
+  return mem[a];
+}
+function pokeMem(a,v){
+  if(a>=0xC000){ if(a<0xC100) peekMem(a); return; }
+  switch(a){
+    case 34: WTOP=Math.min(v,23); if(WBOT<=WTOP) WBOT=24; if(CV<WTOP) CV=WTOP; break;
+    case 35: WBOT=Math.max(WTOP+1,Math.min(v,24)); if(CV>=WBOT) CV=WBOT-1; break;
+    case 36: CH=Math.min(v,39); break;
+    case 37: CV=Math.min(v,23); break;
+    case 50: invMode=v===0x3F?1:v===0x7F?2:0; break;
+    case 230: hpage=v===0x40?0x4000:0x2000; break;
+  }
+  mem[a]=v;
+}
+
+// ---------- Tokens (Applesoft-Reihenfolge) ----------
+const KW=['END','FOR','NEXT','DATA','INPUT','DEL','DIM','READ','GR','TEXT','PR#','IN#','CALL','PLOT','HLIN','VLIN',
+'HGR2','HGR','HCOLOR=','HPLOT','DRAW','XDRAW','HTAB','HOME','ROT=','SCALE=','SHLOAD','TRACE','NOTRACE','NORMAL',
+'INVERSE','FLASH','COLOR=','POP','VTAB','HIMEM:','LOMEM:','ONERR','RESUME','RECALL','STORE','SPEED=','LET','GOTO',
+'RUN','IF','RESTORE','&','GOSUB','RETURN','REM','STOP','ON','WAIT','LOAD','SAVE','DEF','POKE','PRINT','CONT','LIST',
+'CLEAR','GET','NEW','TAB(','TO','FN','SPC(','THEN','AT','NOT','STEP','AND','OR','SGN','INT','ABS','USR','FRE',
+'SCRN(','PDL','POS','SQR','RND','LOG','EXP','COS','SIN','TAN','ATN','PEEK','LEN','STR$','VAL','ASC','CHR$','LEFT$',
+'RIGHT$','MID$'];
+const KC={}; KW.forEach((k,i)=>KC[k]=0x80+i);
+const KWS=KW.map((k,i)=>({k,i})).sort((a,b)=>b.k.length-a.k.length);
+
+function matchKw(s,i,k){ let j=i; for(let m=0;m<k.length;m++){ if(m>0) while(s[j]===' ') j++; if(s[j]!==k[m]) return 0; j++; } return j; }
+function crunch(s){
+  let out='',i=0; const n=s.length;
+  while(i<n){
+    const x=s[i];
+    if(x===' '){ i++; continue; }
+    if(x==='"'){ let j=i+1; while(j<n&&s[j]!=='"') j++; out+=s.slice(i,Math.min(j+1,n)); i=j+1; continue; }
+    let f=null,end=0;
+    for(const e of KWS){ const r=matchKw(s,i,e.k); if(r){ f=e; end=r; break; } }
+    if(f&&f.k==='AT'){ let j=end; while(s[j]===' ') j++; if(s[j]==='O') f=null; }   // "A TO" statt "AT O"
+    if(f){
+      out+=String.fromCharCode(0x80+f.i); i=end;
+      if(f.k==='REM'){ out+=s.slice(i); break; }
+      if(f.k==='DATA'){ let q=false; while(i<n){ const y=s[i]; if(y==='"') q=!q; else if(y===':'&&!q) break; out+=y; i++; } }
+      continue;
+    }
+    out+=x; i++;
+  }
+  return out;
+}
+function detok(t){
+  let s='',q=false,raw=false,data=false;
+  for(let i=0;i<t.length;i++){
+    const c=t.charCodeAt(i), x=t[i];
+    if(raw||q){ s+=x; if(q&&x==='"') q=false; continue; }
+    if(data){ if(x==='"') q=true; if(x===':') data=false; s+=x; continue; }
+    if(c>=0x80){ const k=KW[c-0x80]; s+=' '+k+' '; if(k==='REM') raw=true; if(k==='DATA') data=true; continue; }
+    if(x==='"'){ q=true; s+=x; continue; }
+    s+='+-*/^<>='.includes(x)?' '+x+' ':x;
+  }
+  return s;
+}
+
+// ---------- Fehler ----------
+const ERR={NEXTFOR:[0,'NEXT WITHOUT FOR'],SYNTAX:[16,'SYNTAX'],RETGOSUB:[22,'RETURN WITHOUT GOSUB'],OOD:[42,'OUT OF DATA'],
+IQ:[53,'ILLEGAL QUANTITY'],OVF:[69,'OVERFLOW'],OOM:[77,'OUT OF MEMORY'],UNDEF:[90,"UNDEF'D STATEMENT"],SUB:[107,'BAD SUBSCRIPT'],
+REDIM:[120,"REDIM'D ARRAY"],DIV0:[133,'DIVISION BY ZERO'],DIRECT:[149,'ILLEGAL DIRECT'],TYPE:[163,'TYPE MISMATCH'],
+LONG:[176,'STRING TOO LONG'],COMPLEX:[191,'FORMULA TOO COMPLEX'],CONT:[214,"CAN'T CONTINUE"],UNDEFFN:[224,"UNDEF'D FUNCTION"]};
+function err(k,line){ throw {basic:k,line}; }
+const WAIT={wait:1};
+
+// ---------- Zustand ----------
+let prog=[], cur={li:-1,t:'',p:0}, stmtStart=0, jumped=false, mode='idle';
+const vars=new Map(), arrs=new Map(), fns=new Map(), stack=[];
+let dp={li:0,p:0,inData:false}, contPos=null, onErr=null, errPos=null, trace=false, inp=null, stall=false, getWait=false;
+let lineCb=null, lineBuf='', linePrompt='', lineInput=false, listQ=null, listAcc=0;
+let rs=(Date.now()*2654435761)|0, rlast=0;
+function prng(){ rs=rs+0x6D2B79F5|0; let t=Math.imul(rs^rs>>>15,1|rs); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; }
+
+function clearVars(){ vars.clear(); arrs.clear(); fns.clear(); stack.length=0; dp={li:0,p:0,inData:false}; onErr=null; inp=null; }
+function findLine(n){ let lo=0,hi=prog.length-1; while(lo<=hi){ const m=(lo+hi)>>1; if(prog[m].n===n) return m; if(prog[m].n<n) lo=m+1; else hi=m-1; } return -1; }
+function setLine(n,t){
+  let lo=0,hi=prog.length; while(lo<hi){ const m=(lo+hi)>>1; if(prog[m].n<n) lo=m+1; else hi=m; }
+  if(lo<prog.length&&prog[lo].n===n){ if(t) prog[lo].t=t; else prog.splice(lo,1); }
+  else if(t) prog.splice(lo,0,{n,t});
+  clearVars(); contPos=null;
+}
+
+// ---------- Parser-Helfer ----------
+const code=()=>cur.p<cur.t.length?cur.t.charCodeAt(cur.p):0;
+const isKw=k=>code()===KC[k];
+function acceptKw(k){ if(isKw(k)){ cur.p++; return true; } return false; }
+function expectKw(k){ if(!acceptKw(k)) err('SYNTAX'); }
+function accept(c){ if(cur.t[cur.p]===c){ cur.p++; return true; } return false; }
+function expect(c){ if(!accept(c)) err('SYNTAX'); }
+const isDigit=c=>c>=48&&c<=57, isAlpha=c=>c>=65&&c<=90;
+const atEnd=()=>{ const c=code(); return c===0||c===58; };
+function num(v){ if(typeof v!=='number') err('TYPE'); return v; }
+function str(v){ if(typeof v!=='string') err('TYPE'); return v; }
+const int=v=>Math.floor(num(v));
+function chk(x){ if(!isFinite(x)||Math.abs(x)>1.7e38) err('OVF'); return x; }
+const LNRE=/\d+/y;
+function lineNum(){ LNRE.lastIndex=cur.p; const m=LNRE.exec(cur.t); if(!m) return 0; cur.p+=m[0].length; return +m[0]; }
+function skipStmt(){ let q=false; const t=cur.t; while(cur.p<t.length){ const c=t[cur.p]; if(c==='"') q=!q; else if(c===':'&&!q) break; cur.p++; } }
+
+// ---------- Zahlenformat wie Applesoft ----------
+function fmt(n){
+  if(n===0) return '0';
+  const neg=n<0; n=Math.abs(n);
+  const m=parseFloat(n.toPrecision(9)); let s;
+  if(m>=1e9||m<0.01){ let [a,e]=m.toExponential(8).split('e'); a=a.replace(/\.?0+$/,''); const ev=+e; s=a+'E'+(ev<0?'-':'+')+String(Math.abs(ev)).padStart(2,'0'); }
+  else { s=String(m); if(s.startsWith('0.')) s=s.slice(1); }
+  return (neg?'-':'')+s;
+}
+
+// ---------- Variablen ----------
+function varName(){
+  const s=cur.t; let p=cur.p;
+  if(!isAlpha(s.charCodeAt(p))) err('SYNTAX');
+  let name=s[p++];
+  while(p<s.length){ const d=s.charCodeAt(p); if(isAlpha(d)||isDigit(d)){ name+=s[p]; p++; } else break; }
+  let suf=''; if(s[p]==='$'||s[p]==='%'){ suf=s[p]; p++; }
+  cur.p=p; return {key:name.slice(0,2)+suf, suf};
+}
+function varRef(){
+  const v=varName();
+  if(accept('(')){ v.idx=[]; do v.idx.push(num(expr())); while(accept(',')); expect(')'); }
+  return v;
+}
+function arrSlot(ref){
+  let a=arrs.get(ref.key);
+  if(!a){ a={dims:ref.idx.map(()=>11)}; a.data=new Array(a.dims.reduce((x,y)=>x*y,1)).fill(ref.suf==='$'?'':0); arrs.set(ref.key,a); }
+  if(ref.idx.length!==a.dims.length) err('SUB');
+  let off=0;
+  for(let i=0;i<ref.idx.length;i++){ const n=Math.trunc(ref.idx[i]); if(n<0) err('IQ'); if(n>=a.dims[i]) err('SUB'); off=off*a.dims[i]+n; }
+  return [a,off];
+}
+function getVar(ref){
+  if(ref.idx){ const [a,o]=arrSlot(ref); return a.data[o]; }
+  const v=vars.get(ref.key); return v===undefined?(ref.suf==='$'?'':0):v;
+}
+function setVar(ref,v){
+  if(ref.suf==='$'){ str(v); if(v.length>255) err('LONG'); }
+  else { num(v); if(ref.suf==='%'){ v=Math.trunc(v); if(v<-32767||v>32767) err('IQ'); } }
+  if(ref.idx){ const [a,o]=arrSlot(ref); a.data[o]=v; } else vars.set(ref.key,v);
+}
+
+// ---------- Ausdrücke ----------
+function expr(){ return orE(); }
+function orE(){ let a=andE(); while(acceptKw('OR')){ const b=andE(); a=(num(a)!==0||num(b)!==0)?1:0; } return a; }
+function andE(){ let a=relE(); while(acceptKw('AND')){ const b=relE(); a=(num(a)!==0&&num(b)!==0)?1:0; } return a; }
+function relE(){
+  let a=addE();
+  for(;;){
+    let op=0;
+    for(;;){ const c=cur.t[cur.p]; if(c==='<'){op|=1;cur.p++;} else if(c==='='){op|=2;cur.p++;} else if(c==='>'){op|=4;cur.p++;} else break; }
+    if(!op) return a;
+    const b=addE(); if(typeof a!==typeof b) err('TYPE');
+    a=(op&(a<b?1:a===b?2:4))?1:0;
+  }
+}
+function addE(){
+  let a=mulE();
+  for(;;){
+    if(accept('+')){ const b=mulE();
+      if(typeof a==='string'&&typeof b==='string'){ a+=b; if(a.length>255) err('LONG'); }
+      else a=chk(num(a)+num(b)); }
+    else if(accept('-')){ a=num(a); a=chk(a-num(mulE())); }
+    else return a;
+  }
+}
+function mulE(){
+  let a=unaryE();
+  for(;;){
+    if(accept('*')){ a=num(a); a=chk(a*num(unaryE())); }
+    else if(accept('/')){ a=num(a); const b=num(unaryE()); if(b===0) err('DIV0'); a=chk(a/b); }
+    else return a;
+  }
+}
+function unaryE(){
+  if(accept('-')) return -num(unaryE());
+  if(accept('+')) return num(unaryE());
+  if(acceptKw('NOT')) return num(unaryE())===0?1:0;
+  return powE();
+}
+function powE(){
+  let a=primary();
+  while(accept('^')){
+    let neg=false; while(accept('-')) neg=!neg;
+    let b=num(primary()); if(neg) b=-b; a=num(a);
+    if(a===0&&b<0) err('DIV0');
+    const r=Math.pow(a,b); if(isNaN(r)) err('IQ'); a=chk(r);
+  }
+  return a;
+}
+const NUMRE=/\d*\.?\d*(?:E[+-]?\d+)?/y;
+function primary(){
+  const c=code();
+  if(c===34){ cur.p++; const e=cur.t.indexOf('"',cur.p); let s; if(e<0){ s=cur.t.slice(cur.p); cur.p=cur.t.length; } else { s=cur.t.slice(cur.p,e); cur.p=e+1; } return s; }
+  if(isDigit(c)||c===46){ NUMRE.lastIndex=cur.p; const m=NUMRE.exec(cur.t); cur.p+=m[0].length; const v=parseFloat(m[0]); return isNaN(v)?0:chk(v); }
+  if(accept('(')){ const v=expr(); expect(')'); return v; }
+  if(c>=0x80) return func();
+  if(isAlpha(c)) return getVar(varRef());
+  err('SYNTAX');
+}
+function addr(v){ const a=Math.floor(num(v)); if(a<-65535||a>65535) err('IQ'); return a<0?a+65536:a; }
+function valOf(s){ const m=/^[+-]?(\d*\.?\d*)(E[+-]?\d+)?/.exec(s.replace(/ /g,'')); const v=parseFloat(m?m[0]:''); return isNaN(v)?0:v; }
+const FUNCS={
+  SGN:a=>Math.sign(num(a)), INT:a=>Math.floor(num(a)), ABS:a=>Math.abs(num(a)), FRE:()=>30000, PDL:a=>{num(a);return 0;},
+  POS:()=>CH, SQR:a=>{ if(num(a)<0) err('IQ'); return Math.sqrt(a); },
+  RND:a=>{ num(a); if(a<0){ rs=Math.floor(a*1e6)|0; rlast=prng(); } else if(a>0) rlast=prng(); return rlast; },
+  LOG:a=>{ if(num(a)<=0) err('IQ'); return Math.log(a); }, EXP:a=>chk(Math.exp(num(a))),
+  COS:a=>Math.cos(num(a)), SIN:a=>Math.sin(num(a)), TAN:a=>chk(Math.tan(num(a))), ATN:a=>Math.atan(num(a)),
+  PEEK:a=>peekMem(addr(a)), LEN:a=>str(a).length, 'STR$':a=>fmt(num(a)), VAL:a=>valOf(str(a)),
+  ASC:a=>{ if(!str(a).length) err('IQ'); return a.charCodeAt(0)&0x7F; },
+  'CHR$':a=>{ const n=int(a); if(n<0||n>255) err('IQ'); return String.fromCharCode(n); }
+};
+function func(){
+  const k=KW[code()-0x80]; cur.p++;
+  if(k==='FN'){
+    const n=varName(); const f=fns.get(n.key); if(!f) err('UNDEFFN');
+    expect('('); const a=num(expr()); expect(')');
+    const old=vars.get(f.param); vars.set(f.param,a);
+    const sv=cur; cur={li:f.li,t:f.t,p:f.p}; let r;
+    try{ r=num(expr()); } finally { cur=sv; if(old===undefined) vars.delete(f.param); else vars.set(f.param,old); }
+    return r;
+  }
+  if(k==='SCRN('){ const x=int(expr()); expect(','); const y=int(expr()); expect(')'); if(x<0||x>39||y<0||y>47) err('IQ'); return lget(x,y); }
+  if(k==='LEFT$'||k==='RIGHT$'||k==='MID$'){
+    expect('('); const s=str(expr()); expect(','); const n=int(expr()); let m=255;
+    if(k==='MID$'&&accept(',')) m=int(expr());
+    expect(')');
+    if(n<1||n>255||m<0||m>255) err('IQ');
+    return k==='LEFT$'?s.slice(0,n):k==='RIGHT$'?s.slice(Math.max(0,s.length-n)):s.substr(n-1,m);
+  }
+  const f=FUNCS[k]; if(!f) err('SYNTAX');
+  expect('('); const a=expr(); expect(')'); return f(a);
+}
+
+// ---------- Programmfluss ----------
+function traceLine(){ if(trace&&cur.li>=0) outStr('#'+prog[cur.li].n+' '); }
+function gotoLine(n){ const i=findLine(n); if(i<0) err('UNDEF'); cur={li:i,t:prog[i].t,p:0}; jumped=true; traceLine(); }
+function pushGosub(){ if(stack.length>=100) err('OOM'); stack.push({type:'gosub',li:cur.li,t:cur.t,p:cur.p}); }
+function nextData(){
+  for(;;){
+    if(dp.li>=prog.length) err('OOD');
+    const t=prog[dp.li].t;
+    if(dp.inData){
+      let p=dp.p, v=''; while(t[p]===' ') p++;
+      if(t[p]==='"'){ p++; while(p<t.length&&t[p]!=='"') v+=t[p++]; p++; while(p<t.length&&t[p]!==','&&t[p]!==':') p++; }
+      else { while(p<t.length&&t[p]!==','&&t[p]!==':') v+=t[p++]; v=v.trimEnd(); }
+      if(t[p]===','){ dp.p=p+1; } else { dp.p=p; dp.inData=false; }
+      return {v,n:prog[dp.li].n};
+    }
+    let p=dp.p, q=false, found=false;
+    while(p<t.length){
+      const c=t.charCodeAt(p);
+      if(c===34) q=!q;
+      else if(!q){ if(c===KC.DATA){ found=true; p++; break; } if(c===KC.REM){ p=t.length; break; } }
+      p++;
+    }
+    if(found){ dp.p=p; dp.inData=true; continue; }
+    dp.li++; dp.p=0;
+  }
+}
+function splitInput(s){
+  const out=[]; let i=0;
+  for(;;){
+    while(s[i]===' ') i++;
+    let f='';
+    if(s[i]==='"'){ i++; while(i<s.length&&s[i]!=='"') f+=s[i++]; i++; while(i<s.length&&s[i]!==',') i++; }
+    else while(i<s.length&&s[i]!==',') f+=s[i++];
+    out.push(f);
+    if(s[i]===','){ i++; continue; }
+    return out;
+  }
+}
+const NUMOK=/^[+-]?(\d+\.?\d*|\.\d*)(E[+-]?\d+)?$/;
+function askLine(pr){ startLine(pr,s=>{ if(inp) inp.line=s; mode='run'; },true); throw WAIT; }
+
+// ---------- Anweisungen ----------
+const ST={};
+function doLet(){ const r=varRef(); expect('='); setVar(r,expr()); }
+ST.LET=doLet;
+ST.PRINT=()=>{
+  let nl=true;
+  while(!atEnd()){
+    if(accept(';')){ nl=false; continue; }
+    if(accept(',')){ nl=false; if(CH>=24) outChar(13); else CH=CH<16?16:32; continue; }
+    if(acceptKw('TAB(')){ const n=int(expr()); expect(')'); if(n<1||n>255) err('IQ'); for(let k=n-1-CH;k>0;k--) outChar(32); nl=true; continue; }
+    if(acceptKw('SPC(')){ const n=int(expr()); expect(')'); if(n<0||n>255) err('IQ'); for(let k=0;k<n;k++) outChar(32); nl=true; continue; }
+    const v=expr(); outStr(typeof v==='string'?v:fmt(v)); nl=true;
+  }
+  if(nl) outChar(13);
+};
+ST.INPUT=()=>{
+  if(cur.li<0) err('DIRECT');
+  let prompt='?';
+  if(code()===34){ prompt=primary(); expect(';'); }
+  const refs=[]; do refs.push(varRef()); while(accept(','));
+  if(!inp){ inp={f:[]}; askLine(prompt); }
+  if(inp.line!==undefined){ inp.f.push(...splitInput(inp.line)); inp.line=undefined; }
+  if(inp.f.length<refs.length) askLine('??');
+  const vals=[];
+  for(let i=0;i<refs.length;i++){
+    const s=inp.f[i];
+    if(refs[i].suf==='$'){ vals.push(s); continue; }
+    const z=s.replace(/ /g,'');
+    if(!NUMOK.test(z)){ outStr('?REENTER'); outChar(13); inp={f:[]}; askLine(prompt); }
+    const v=parseFloat(z); vals.push(isNaN(v)?0:v);
+  }
+  const extra=inp.f.length>refs.length; inp=null;
+  refs.forEach((r,i)=>setVar(r,vals[i]));
+  if(extra){ outStr('?EXTRA IGNORED'); outChar(13); }
+};
+ST.GET=()=>{
+  if(cur.li<0) err('DIRECT');
+  const r=varRef();
+  if(!(kbd&0x80)){ getWait=true; stall=true; throw WAIT; }
+  const c=kbd&0x7F; clearStrobe();
+  if(r.suf==='$') setVar(r,String.fromCharCode(c));
+  else { if(!isDigit(c)) err('SYNTAX'); setVar(r,c-48); }
+};
+ST.IF=()=>{
+  const v=expr();
+  const t=typeof v==='string'?v.length>0:v!==0;
+  if(!acceptKw('THEN')&&!isKw('GOTO')) err('SYNTAX');
+  jumped=true;
+  if(!t){ cur.p=cur.t.length; return; }
+  if(isDigit(code())) gotoLine(lineNum());
+};
+ST.GOTO=()=>gotoLine(lineNum());
+ST.GOSUB=()=>{ const n=lineNum(); pushGosub(); gotoLine(n); };
+ST.RETURN=()=>{
+  let i=stack.length-1; while(i>=0&&stack[i].type!=='gosub') i--;
+  if(i<0) err('RETGOSUB');
+  const f=stack[i]; stack.length=i; cur={li:f.li,t:f.t,p:f.p}; jumped=true;
+};
+ST.POP=()=>{ let i=stack.length-1; while(i>=0&&stack[i].type!=='gosub') i--; if(i<0) err('RETGOSUB'); stack.length=i; };
+ST.ON=()=>{
+  const v=int(expr()); if(v<0||v>255) err('IQ');
+  let sub; if(acceptKw('GOTO')) sub=false; else if(acceptKw('GOSUB')) sub=true; else err('SYNTAX');
+  const L=[]; do L.push(lineNum()); while(accept(','));
+  if(v<1||v>L.length) return;
+  if(sub) pushGosub();
+  gotoLine(L[v-1]);
+};
+ST.FOR=()=>{
+  const r=varRef(); if(r.idx||r.suf) err('SYNTAX');
+  expect('='); const start=num(expr()); expectKw('TO'); const lim=num(expr());
+  let step=1; if(acceptKw('STEP')) step=num(expr());
+  setVar(r,start);
+  for(let i=stack.length-1;i>=0&&stack[i].type==='for';i--) if(stack[i].key===r.key){ stack.length=i; break; }
+  if(stack.length>=100) err('OOM');
+  stack.push({type:'for',key:r.key,lim,step,li:cur.li,t:cur.t,p:cur.p});
+};
+ST.NEXT=()=>{
+  do{
+    let key=null; if(isAlpha(code())){ const r=varName(); key=r.key; }
+    let i=stack.length-1;
+    for(;i>=0;i--){ if(stack[i].type!=='for'){ i=-1; break; } if(!key||stack[i].key===key) break; }
+    if(i<0) err('NEXTFOR');
+    stack.length=i+1; const f=stack[i];
+    const v=chk(vars.get(f.key)+f.step); vars.set(f.key,v);
+    if(f.step>=0?v<=f.lim:v>=f.lim){ cur={li:f.li,t:f.t,p:f.p}; jumped=true; return; }
+    stack.length=i;
+  }while(accept(','));
+};
+ST.DIM=()=>{
+  do{
+    const v=varName(); expect('('); const d=[]; do{ const n=int(expr()); if(n<0) err('IQ'); d.push(n+1); }while(accept(',')); expect(')');
+    if(arrs.has(v.key)) err('REDIM');
+    const size=d.reduce((x,y)=>x*y,1); if(size>500000) err('OOM');
+    arrs.set(v.key,{dims:d,data:new Array(size).fill(v.suf==='$'?'':0)});
+  }while(accept(','));
+};
+ST.READ=()=>{
+  do{
+    const r=varRef(), it=nextData();
+    if(r.suf==='$') setVar(r,it.v);
+    else { const z=it.v.replace(/ /g,''); if(z!==''&&!NUMOK.test(z)) err('SYNTAX',it.n); const v=parseFloat(z); setVar(r,isNaN(v)?0:v); }
+  }while(accept(','));
+};
+ST.DATA=()=>skipStmt();
+ST.REM=()=>{ cur.p=cur.t.length; };
+ST.RESTORE=()=>{ dp={li:0,p:0,inData:false}; };
+ST.DEF=()=>{
+  if(cur.li<0) err('DIRECT');
+  expectKw('FN'); const n=varName(); expect('('); const pr=varName(); expect(')'); expect('=');
+  if(n.suf||pr.suf) err('SYNTAX');
+  fns.set(n.key,{param:pr.key,li:cur.li,t:cur.t,p:cur.p}); skipStmt();
+};
+ST.END=()=>{ if(cur.li>=0) contPos={li:cur.li,t:cur.t,p:cur.p}; showPrompt(); };
+ST.STOP=()=>{ if(cur.li<0){ showPrompt(); return; } contPos={li:cur.li,t:cur.t,p:cur.p}; if(CH) outChar(13); outStr('BREAK IN '+prog[cur.li].n); showPrompt(); };
+ST.CONT=()=>{ if(!contPos) err('CONT'); cur={...contPos}; contPos=null; jumped=true; };
+ST.RUN=()=>{
+  const n=isDigit(code())?lineNum():null;
+  clearVars(); contPos=null;
+  if(!prog.length){ cur.p=cur.t.length; jumped=true; return; }
+  if(n!==null) gotoLine(n); else { cur={li:0,t:prog[0].t,p:0}; jumped=true; traceLine(); }
+};
+ST.NEW=()=>{ const inProg=cur.li>=0; prog=[]; clearVars(); contPos=null; if(inProg) showPrompt(); };
+ST.CLEAR=()=>clearVars();
+ST.DEL=()=>{
+  const a=lineNum(); expect(','); const b=lineNum();
+  const inProg=cur.li>=0; prog=prog.filter(l=>l.n<a||l.n>b); clearVars(); contPos=null;
+  if(inProg) showPrompt();
+};
+ST.LIST=()=>{
+  let a=0,b=63999;
+  if(isDigit(code())){ a=b=lineNum(); if(accept('-')||accept(',')) b=isDigit(code())?lineNum():63999; }
+  else if(accept('-')||accept(',')) b=lineNum();
+  const L=prog.filter(l=>l.n>=a&&l.n<=b).map(l=>l.n+' '+detok(l.t));
+  if(cur.li<0){ listQ=L; listAcc=1; mode='list'; cur.p=cur.t.length; jumped=true; }
+  else L.forEach(s=>{ outStr(s); outChar(13); });
+};
+ST.ONERR=()=>{ expectKw('GOTO'); onErr=lineNum(); };
+ST.RESUME=()=>{ if(!errPos) err('SYNTAX'); cur={...errPos}; errPos=null; jumped=true; };
+ST.TRACE=()=>{ trace=true; };
+ST.NOTRACE=()=>{ trace=false; };
+ST.NORMAL=()=>{ invMode=0; };
+ST.INVERSE=()=>{ invMode=1; };
+ST.FLASH=()=>{ invMode=2; };
+ST.HOME=()=>home();
+ST.HTAB=()=>{ const n=int(expr()); if(n<1||n>255) err('IQ'); CH=(n-1)%40; };
+ST.VTAB=()=>{ const n=int(expr()); if(n<1||n>24) err('IQ'); CV=n-1; };
+ST['SPEED=']=()=>{ const n=int(expr()); if(n<0||n>255) err('IQ'); charDelay=(255-n)*(255-n)*1.5; };
+ST['HIMEM:']=ST['LOMEM:']=ST['PR#']=ST['IN#']=()=>{ num(expr()); };
+ST.POKE=()=>{ const a=addr(expr()); expect(','); const v=int(expr()); if(v<0||v>255) err('IQ'); pokeMem(a,v); };
+ST.CALL=()=>{
+  switch(addr(expr())){
+    case 0xFC58: home(); break;
+    case 0xFC42: clrEOS(); break;
+    case 0xFC9C: clrEOL(); break;
+    case 0xFBE4: case 0xFF3A: bell(); break;
+  }
+};
+ST.WAIT=()=>{
+  const a=addr(expr()); expect(','); const m=int(expr()); let x=0; if(accept(',')) x=int(expr());
+  if(((peekMem(a)^x)&m)===0){ stall=true; throw WAIT; }
+};
+ST.TEXT=()=>{ sText=true; sMixed=false; sPage2=false; WTOP=0; WBOT=24; CV=23; };
+ST.GR=()=>{ sText=false; sMixed=true; sHires=false; sPage2=false; for(let r=0;r<20;r++) mem.fill(0,taddr(r),taddr(r)+40); WTOP=20; WBOT=24; CV=23; };
+ST.HGR=()=>{ sText=false; sMixed=true; sHires=true; sPage2=false; mem.fill(0,0x2000,0x4000); hpage=0x2000; WTOP=20; WBOT=24; if(CV<20) CV=23; };
+ST.HGR2=()=>{ sText=false; sMixed=false; sHires=true; sPage2=true; mem.fill(0,0x4000,0x6000); hpage=0x4000; };
+ST['COLOR=']=()=>{ const n=int(expr()); if(n<0||n>255) err('IQ'); lcolor=n&15; };
+ST['HCOLOR=']=()=>{ const n=int(expr()); if(n<0||n>7) err('IQ'); hcolor=n; };
+function lxy(){ const x=int(expr()); expect(','); const y=int(expr()); if(x<0||x>39||y<0||y>47) err('IQ'); return [x,y]; }
+ST.PLOT=()=>{ const [x,y]=lxy(); lplot(x,y); };
+ST.HLIN=()=>{ const a=int(expr()); expect(','); const b=int(expr()); expectKw('AT'); const y=int(expr());
+  if(a<0||a>39||b<0||b>39||y<0||y>47) err('IQ'); for(let x=Math.min(a,b);x<=Math.max(a,b);x++) lplot(x,y); };
+ST.VLIN=()=>{ const a=int(expr()); expect(','); const b=int(expr()); expectKw('AT'); const x=int(expr());
+  if(a<0||a>47||b<0||b>47||x<0||x>39) err('IQ'); for(let y=Math.min(a,b);y<=Math.max(a,b);y++) lplot(x,y); };
+function hxy(){ const x=int(expr()); expect(','); const y=int(expr()); if(x<0||x>279||y<0||y>191) err('IQ'); return [x,y]; }
+ST.HPLOT=()=>{
+  if(!acceptKw('TO')){ const [x,y]=hxy(); hplot(x,y); hx=x; hy=y; if(!acceptKw('TO')) return; }
+  do{ const [x,y]=hxy(); hline(hx,hy,x,y); hx=x; hy=y; }while(acceptKw('TO'));
+};
+
+// ---------- Ausführung ----------
+function statement(){
+  const c=code();
+  if(c>=0x80){ cur.p++; const f=ST[KW[c-0x80]]; if(!f) err('SYNTAX'); f(); }
+  else if(isAlpha(c)) doLet();
+  else err('SYNTAX');
+}
+function execOne(){
+  while(cur.p<cur.t.length&&cur.t.charCodeAt(cur.p)===58) cur.p++;
+  if(cur.p>=cur.t.length){
+    if(cur.li<0){ showPrompt(); return; }
+    const i=cur.li+1;
+    if(i>=prog.length){ contPos=null; showPrompt(); return; }
+    cur={li:i,t:prog[i].t,p:0}; traceLine(); return;
+  }
+  stmtStart=cur.p; jumped=false;
+  statement();
+  if(!jumped&&mode==='run'&&cur.p<cur.t.length&&cur.t.charCodeAt(cur.p)!==58) err('SYNTAX');
+}
+function handleError(e){
+  let c,msg;
+  if(e&&e.basic) [c,msg]=ERR[e.basic];
+  else { if(typeof console!=='undefined') console.error(e); [c,msg]=e instanceof RangeError?ERR.COMPLEX:ERR.SYNTAX; }
+  inp=null; stall=false;
+  if(onErr!==null&&cur.li>=0){
+    const n=prog[cur.li].n; mem[222]=c; mem[218]=n&255; mem[219]=n>>8;
+    errPos={li:cur.li,t:cur.t,p:stmtStart};
+    const target=onErr;
+    try{ gotoLine(target); return; }catch(e2){ onErr=null; }
+  }
+  if(CH) outChar(13);
+  const line=e&&e.line!==undefined?e.line:(cur.li>=0?prog[cur.li].n:null);
+  outStr('?'+msg+' ERROR'+(line!==null?' IN '+line:''));
+  bell(); contPos=null; showPrompt();
+}
+function doBreak(){
+  const inProg=cur.li>=0; contPos=inProg?{li:cur.li,t:cur.t,p:cur.p}:null;
+  if(CH) outChar(13); outStr(inProg?'BREAK IN '+prog[cur.li].n:'BREAK'); showPrompt();
+}
+
+// ---------- Zeileneingabe (GETLN) ----------
+function startLine(pr,cb,isInput){ outStr(pr); linePrompt=pr; lineCb=cb; lineBuf=''; lineInput=!!isInput; mode='line'; }
+function showPrompt(){ inp=null; getWait=false; stall=false; listQ=null; if(CH) outChar(13); startLine(']',handleDirect,false); }
+function addCh(c){ if(lineBuf.length>=239){ bell(); return; } if(c>=0x60) c-=0x20; lineBuf+=String.fromCharCode(c); outChar(c); }
+function processKeys(){
+  while(mode==='line'&&(kbd&0x80)){
+    const c=kbd&0x7F; clearStrobe();
+    if(c===13){ outChar(13); const s=lineBuf, cb=lineCb; lineBuf=''; lineCb=null; mode='idle'; cb(s); }
+    else if(c===8){ if(lineBuf.length){ lineBuf=lineBuf.slice(0,-1); if(CH>0) CH--; else { CH=39; if(CV>WTOP) CV--; } mem[taddr(CV)+CH]=0xA0; } }
+    else if(c===21){ const b=mem[taddr(CV)+CH]&0x3F; addCh(b<0x20?b+0x40:b); }
+    else if(c===24){ outChar(92); outChar(13); lineBuf=''; outStr(linePrompt); }
+    else if(c===3&&lineInput) doBreak();
+    else if(c>=32) addCh(c);
+  }
+}
+
+// ---------- Disk-Befehle (im Browser gespeichert) ----------
+const FP='a2basic:';
+function store(){ try{ return localStorage; }catch(e){ return null; } }
+function dosMsg(m){ if(CH) outChar(13); outChar(13); outStr(m); bell(); showPrompt(); }
+function dos(s){
+  const m=/^\s*(SAVE|LOAD|DELETE|CATALOG|RUN)\s*(.*?)\s*$/.exec(s); if(!m) return false;
+  const cmd=m[1], name=m[2];
+  if(cmd==='RUN'&&(!name||/^\d/.test(name))) return false;
+  if(cmd==='CATALOG'&&name) return false;
+  const ls=store(); if(!ls){ dosMsg('I/O ERROR'); return true; }
+  try{
+    if(cmd==='CATALOG'){
+      if(CH) outChar(13); outChar(13); outStr('DISK VOLUME 254'); outChar(13); outChar(13);
+      const names=[]; for(let i=0;i<ls.length;i++){ const k=ls.key(i); if(k&&k.startsWith(FP)) names.push(k); }
+      names.sort().forEach(k=>{ const sec=Math.min(999,1+Math.ceil(ls.getItem(k).length/256)); outStr(' A '+String(sec).padStart(3,'0')+' '+k.slice(FP.length)); outChar(13); });
+      showPrompt(); return true;
+    }
+    if(!name||name.length>30){ dosMsg('SYNTAX ERROR'); return true; }
+    if(cmd==='SAVE'){ ls.setItem(FP+name,JSON.stringify(prog.map(l=>[l.n,l.t]))); showPrompt(); return true; }
+    const d=ls.getItem(FP+name);
+    if(d===null){ dosMsg('FILE NOT FOUND'); return true; }
+    if(cmd==='DELETE'){ ls.removeItem(FP+name); showPrompt(); return true; }
+    prog=JSON.parse(d).map(([n,t])=>({n,t})); clearVars(); contPos=null;
+    if(cmd==='RUN'){ cur={li:-1,t:String.fromCharCode(KC.RUN),p:0}; mode='run'; } else showPrompt();
+  }catch(e){ dosMsg('I/O ERROR'); }
+  return true;
+}
+function handleDirect(s){
+  const m=/^\s*(\d+)(.*)$/.exec(s);
+  if(m){
+    const n=+m[1];
+    if(n>63999){ cur={li:-1,t:'',p:0}; handleError({basic:'SYNTAX'}); return; }
+    setLine(n,crunch(m[2])); showPrompt(); return;
+  }
+  if(dos(s)) return;
+  const t=crunch(s);
+  if(!t){ showPrompt(); return; }
+  cur={li:-1,t,p:0}; mode='run';
+}
+
+// ---------- Takt: ein Bildschirm-Frame ----------
+let vc=0, execBudget=0;
+function doList(dt){
+  if(kbd===0x83){ clearStrobe(); showPrompt(); return; }
+  listAcc+=dt*0.06;
+  while(listAcc>=1&&listQ.length){ const s=listQ.shift(); outStr(s); outChar(13); listAcc--; }
+  if(!listQ.length) showPrompt();
+}
+function tick(dt){
+  const dtc=dt*CLK/1000, c0=vc, c1=vc+dtc; vc=c1; tnow=c0; sub=0;
+  if(mode==='line') processKeys();
+  if(mode==='list') doList(dt);
+  if(mode==='run'){
+    const base=c0+Math.max(0,-execBudget);
+    execBudget=Math.min(execBudget+dtc,dtc*2);
+    let used=0; stall=false;
+    while(mode==='run'&&used<execBudget&&!stall){
+      tnow=base+used; sub=0; extraCyc=0; getWait=false;
+      if(kbd===0x83){ clearStrobe(); doBreak(); break; }
+      try{ execOne(); }
+      catch(e){ if(e===WAIT) cur.p=stmtStart; else handleError(e); }
+      used+=STMT+extraCyc;
+    }
+    execBudget-=used;
+    if(mode!=='run'||stall) execBudget=Math.min(execBudget,0);
+  } else execBudget=Math.min(execBudget,0);
+  if(mode==='line') processKeys();
+  return [c0,c1];
+}
+function doReset(){
+  kq.length=0; kbd=0; sText=true; sMixed=sHires=sPage2=false; WTOP=0; WBOT=24; invMode=0;
+  showPrompt();
+}
+function boot(){
+  for(let r=0;r<24;r++) mem.fill(0xA0,taddr(r),taddr(r)+40);
+  CH=16; CV=0; outStr('APPLE ]['); outChar(13); showPrompt();
+}
+</script>
+
+<!-- ===== Bildschirm, Ton, Tastatur ===== -->
+<script>
+'use strict';
+// ---- Video (grüner Monochrom-Monitor) ----
+const cv=document.getElementById('screen'), ctx=cv.getContext('2d');
+const img=ctx.createImageData(280,192), pix=new Uint32Array(img.data.buffer);
+const shade=l=>{ const r=Math.round(0x3C*l), g=Math.round(0xFF*l), b=Math.round(0x6E*l); return (0xFF000000|(b<<16)|(g<<8)|r)>>>0; };
+const FG=shade(1), BG=0;
+const LO=[0,.35,.3,.6,.35,.5,.55,.75,.4,.6,.5,.8,.65,.9,.85,1].map(l=>l?shade(l):BG);
+const FONT=new Uint8Array(('0E11151716100F 040A11111F1111 1E11111E11111E 0E11101010110E 1E11111111111E 1F10101E10101F 1F10101E101010 0F10101311110F '+
+'1111111F111111 0E04040404040E 0101010101110E 11121418141211 1010101010101F 111B1515111111 11111915131111 0E11111111110E '+
+'1E11111E101010 0E11111115120D 1E11111E141211 0E11100E01110E 1F040404040404 1111111111110E 11111111110A04 11111115151B11 '+
+'11110A040A1111 11110A04040404 1F01020408101F 1F18181818181F 00100804020100 1F03030303031F 0000040A110000 0000000000001F '+
+'00000000000000 04040404040004 0A0A0A00000000 0A0A1F0A1F0A0A 040F140E051E04 18190204081303 0814140815120D 04040400000000 '+
+'04081010100804 04020101010204 04150E040E1504 0004041F040400 00000000040408 0000001F000000 00000000000004 00010204081000 '+
+'0E11131519110E 040C040404040E 0E11010608101F 1F01020601110E 02060A121F0202 1F101E0101110E 0708101E11110E 1F010204080808 '+
+'0E11110E11110E 0E11110F01021C 00000400040000 00000400040408 02040810080402 00001F001F0000 08040201020408 0E110204040004')
+  .replace(/\s/g,'').match(/../g).map(h=>parseInt(h,16)));
+
+function drawCell(r,c,b,flash,forceInv){
+  const g=(b&0x3F)*7; let inv=b<0x40||(b<0x80&&flash); if(forceInv) inv=!inv;
+  let o=r*2240+c*7;
+  for(let y=0;y<8;y++,o+=280){
+    const bits=y<7?FONT[g+y]:0;
+    for(let x=0;x<7;x++){ let on=(x>=1&&x<=5)?(bits>>(5-x))&1:0; if(inv) on^=1; pix[o+x]=on?FG:BG; }
+  }
+}
+function textRows(r0,r1,pg,flash){
+  for(let r=r0;r<r1;r++){ const base=pg+((r&7)<<7)+(r>>3)*40; for(let c=0;c<40;c++) drawCell(r,c,mem[base+c],flash,false); }
+}
+function lores(r0,r1,pg){
+  for(let r=r0;r<r1;r++){
+    const base=pg+((r&7)<<7)+(r>>3)*40;
+    for(let c=0;c<40;c++){
+      const b=mem[base+c], top=LO[b&15], bot=LO[b>>4];
+      let o=r*2240+c*7;
+      for(let y=0;y<8;y++,o+=280){ const col=y<4?top:bot; for(let x=0;x<7;x++) pix[o+x]=col; }
+    }
+  }
+}
+function hires(y0,y1,page){
+  for(let y=y0;y<y1;y++){
+    const a=page+((y&7)<<10)+(((y>>3)&7)<<7)+(y>>6)*40; let o=y*280;
+    for(let i=0;i<40;i++){ const b=mem[a+i]; for(let k=0;k<7;k++) pix[o++]=(b>>k)&1?FG:BG; }
+  }
+}
+function render(t){
+  const flash=((t/270)|0)&1, tp=(sPage2&&!sHires)?0x800:0x400;
+  if(sText) textRows(0,24,tp,flash);
+  else{
+    const end=sMixed?20:24;
+    if(sHires) hires(0,end*8,sPage2?0x4000:0x2000); else lores(0,end,tp);
+    if(sMixed) textRows(20,24,tp,flash);
+  }
+  if((mode==='line'||getWait)&&flash&&(sText||(sMixed&&CV>=20)))
+    drawCell(CV,CH,mem[tp+((CV&7)<<7)+(CV>>3)*40+CH],false,true);
+  ctx.putImageData(img,0,0);
+}
+
+// ---- Ton (Lautsprecher $C030) ----
+let actx=null, audioT=0, sAcc=0, spk=1, hpX=0, hpY=0;
+function audioInit(){
+  if(!actx){ try{ actx=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ return; } }
+  if(actx.state!=='running') actx.resume();
+}
+function audio(c0,c1){
+  let k=0; while(k<toggles.length&&toggles[k]<c1) k++;
+  if(!actx||actx.state!=='running'){ if(k&1) spk=-spk; toggles.splice(0,k); return; }
+  const sr=actx.sampleRate, cps=CLK/sr;
+  sAcc+=(c1-c0)/cps; const n=Math.floor(sAcc); sAcc-=n;
+  if(n<=0||(!k&&Math.abs(hpY)<1e-4)){ if(k&1) spk=-spk; toggles.splice(0,k); return; }
+  const buf=actx.createBuffer(1,n,sr), d=buf.getChannelData(0);
+  let ti=0;
+  for(let j=0;j<n;j++){
+    const c=c0+j*cps;
+    while(ti<k&&toggles[ti]<=c){ spk=-spk; ti++; }
+    const x=spk*0.25; hpY=x-hpX+0.995*hpY; hpX=x; d[j]=hpY;
+  }
+  for(;ti<k;ti++) spk=-spk;
+  toggles.splice(0,k);
+  const now=actx.currentTime;
+  if(audioT<now+0.01||audioT>now+0.25) audioT=now+0.04;
+  const src=actx.createBufferSource(); src.buffer=buf; src.connect(actx.destination);
+  src.start(audioT); audioT+=n/sr;
+}
+
+// ---- Tastatur ----
+const kb=document.getElementById('kb');
+const SPECIAL={Enter:13,Backspace:8,ArrowLeft:8,ArrowRight:21,Escape:27};
+const MAPCH={'“':'"','”':'"','„':'"','‘':"'",'’':"'",'\n':'\r'};
+window.addEventListener('keydown',e=>{
+  audioInit();
+  if(e.metaKey||e.isComposing) return;
+  if(e.ctrlKey&&e.key.length===1){
+    const c=e.key.toUpperCase().charCodeAt(0);
+    if(c>=0x40&&c<=0x5F){ key(c&0x1F); e.preventDefault(); }
+    return;
+  }
+  const s=SPECIAL[e.key];
+  if(s!==undefined){ key(s); e.preventDefault(); }
+});
+function typeText(t){ for(const ch of t){ const m=MAPCH[ch]||ch; key(m.charCodeAt(0)); } }
+kb.addEventListener('input',e=>{
+  if(e.isComposing||e.inputType==='insertCompositionText') return;
+  if(e.inputType==='deleteContentBackward') key(8);
+  else if(e.data) typeText(e.data);
+  kb.value=' ';
+});
+kb.addEventListener('compositionend',e=>{ if(e.data) typeText(e.data); kb.value=' '; });
+
+// ---- Buttons ----
+function btn(el,fn){
+  const h=e=>{ e.preventDefault(); audioInit(); fn(); };
+  el.addEventListener('touchstart',h,{passive:false});
+  el.addEventListener('mousedown',h);
+}
+btn(document.getElementById('reset'),doReset);
+document.querySelectorAll('[data-k]').forEach(b=>btn(b,()=>key(+b.dataset.k)));
+document.getElementById('crt').addEventListener('click',()=>{ audioInit(); kb.focus(); });
+document.addEventListener('touchend',audioInit);
+document.addEventListener('click',audioInit);
+
+// ---- Hauptschleife ----
+let last=0;
+function loop(t){
+  requestAnimationFrame(loop);
+  let dt=last?t-last:16; last=t; if(dt>100) dt=100;
+  const [c0,c1]=tick(dt);
+  audio(c0,c1);
+  render(t);
+}
+boot();
+kb.focus();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
