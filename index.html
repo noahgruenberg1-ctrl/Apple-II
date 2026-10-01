@@ -11,6 +11,8 @@ html,body{margin:0;background:#0d0d0c;color:#ccc;font-family:-apple-system,syste
 #crt{position:relative;width:100%;width:min(100%,calc((100dvh - 120px) * 4 / 3));aspect-ratio:4/3;background:radial-gradient(ellipse at center,#0b2112 0%,#030904 78%);border-radius:22px;overflow:hidden;box-shadow:inset 0 0 50px rgba(0,0,0,.9),0 0 0 10px #1b1b19,0 0 0 12px #2c2c28}
 #screen{position:absolute;left:5%;top:5%;width:90%;height:90%;image-rendering:pixelated;image-rendering:crisp-edges;filter:drop-shadow(0 0 1.5px rgba(90,255,140,.9)) drop-shadow(0 0 6px rgba(60,255,110,.35))}
 #crt::after{content:'';position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(to bottom,rgba(0,0,0,.28) 0,rgba(0,0,0,.28) 1px,transparent 1px,transparent 3px),radial-gradient(ellipse at center,transparent 58%,rgba(0,0,0,.6) 100%)}
+#crt.color{background:radial-gradient(ellipse at center,#16181a 0%,#050506 78%)}
+#crt.color #screen{filter:drop-shadow(0 0 1.2px rgba(255,255,255,.45)) drop-shadow(0 0 5px rgba(255,255,255,.12))}
 #bar,#bar2{display:flex;flex-wrap:wrap;gap:8px;margin-top:22px;width:100%;max-width:960px}
 #bar2{margin-top:10px}
 #bar button,#bar2 button{flex:1 1 0;min-width:52px;padding:12px 6px;font-size:15px;background:#222220;color:#9fd8a8;border:1px solid #3a3a36;border-radius:8px;font-family:inherit}
@@ -34,6 +36,7 @@ html,body{margin:0;background:#0d0d0c;color:#ccc;font-family:-apple-system,syste
   <div id="bar2">
     <button id="save">💾 Als Datei speichern</button>
     <button id="load">📂 Datei laden</button>
+    <button id="mon">🎨 Farbe</button>
   </div>
 </div>
 <input id="kb" type="text" value=" " autocapitalize="characters" autocomplete="off" autocorrect="off" spellcheck="false">
@@ -738,8 +741,24 @@ function boot(){
 const cv=document.getElementById('screen'), ctx=cv.getContext('2d');
 const img=ctx.createImageData(280,192), pix=new Uint32Array(img.data.buffer);
 const shade=l=>{ const r=Math.round(0x3C*l), g=Math.round(0xFF*l), b=Math.round(0x6E*l); return (0xFF000000|(b<<16)|(g<<8)|r)>>>0; };
-const FG=shade(1), BG=0;
-const LO=[0,.35,.3,.6,.35,.5,.55,.75,.4,.6,.5,.8,.65,.9,.85,1].map(l=>l?shade(l):BG);
+const rgb=h=>(0xFF000000|((h&0xFF)<<16)|(h&0xFF00)|((h>>16)&0xFF))>>>0;
+const BG=0;
+// Grüner Monitor: alles in Grüntönen
+const G_FG=shade(1);
+const G_LO=[0,.35,.3,.6,.35,.5,.55,.75,.4,.6,.5,.8,.65,.9,.85,1].map(l=>l?shade(l):BG);
+// Farb-Fernseher: echte Apple-II-Farben
+const C_FG=rgb(0xFFFFFF);
+const C_LO=[0x000000,0xDD0033,0x000099,0xDD22DD,0x007722,0x555555,0x2222FF,0x66AAFF,
+            0x885500,0xFF6600,0xAAAAAA,0xFF9988,0x11DD00,0xFFFF00,0x44FF99,0xFFFFFF].map((h,i)=>i?rgb(h):BG);
+const C_HC=[0xDD22FF,0x22DD22,0x2299FF,0xFF7722].map(rgb);   // violett, grün, blau, orange
+let colorMode=false; try{ colorMode=localStorage.getItem('a2basic_color')==='1'; }catch(e){}
+let FG=G_FG, LO=G_LO;
+function applyMonitor(){
+  FG=colorMode?C_FG:G_FG; LO=colorMode?C_LO:G_LO;
+  document.getElementById('crt').classList.toggle('color',colorMode);
+  document.getElementById('mon').textContent=colorMode?'🖥️ Grüner Monitor':'🎨 Farbe';
+  try{ localStorage.setItem('a2basic_color',colorMode?'1':'0'); }catch(e){}
+}
 const FONT=new Uint8Array(('0E11151716100F 040A11111F1111 1E11111E11111E 0E11101010110E 1E11111111111E 1F10101E10101F 1F10101E101010 0F10101311110F '+
 '1111111F111111 0E04040404040E 0101010101110E 11121418141211 1010101010101F 111B1515111111 11111915131111 0E11111111110E '+
 '1E11111E101010 0E11111115120D 1E11111E141211 0E11100E01110E 1F040404040404 1111111111110E 11111111110A04 11111115151B11 '+
@@ -771,10 +790,21 @@ function lores(r0,r1,pg){
     }
   }
 }
+const hb=new Uint8Array(282), hp=new Uint8Array(282);
 function hires(y0,y1,page){
   for(let y=y0;y<y1;y++){
     const a=page+((y&7)<<10)+(((y>>3)&7)<<7)+(y>>6)*40; let o=y*280;
-    for(let i=0;i<40;i++){ const b=mem[a+i]; for(let k=0;k<7;k++) pix[o++]=(b>>k)&1?FG:BG; }
+    if(!colorMode){
+      for(let i=0;i<40;i++){ const b=mem[a+i]; for(let k=0;k<7;k++) pix[o++]=(b>>k)&1?FG:BG; }
+      continue;
+    }
+    // Farbe wie am NTSC-Fernseher: einzelne Punkte farbig, Nachbarpunkte weiß
+    for(let i=0;i<40;i++){ const b=mem[a+i], p=b>>7; for(let k=0;k<7;k++){ const idx=1+i*7+k; hb[idx]=(b>>k)&1; hp[idx]=p; } }
+    for(let x=0;x<280;x++){
+      const i=x+1;
+      if(hb[i]) pix[o+x]=(hb[i-1]||hb[i+1])?FG:C_HC[(hp[i]<<1)|(x&1)];
+      else pix[o+x]=(hb[i-1]&&hb[i+1])?C_HC[(hp[i-1]<<1)|((x-1)&1)]:BG;
+    }
   }
 }
 function render(t){
@@ -883,6 +913,8 @@ fileIn.addEventListener('change',async()=>{
 });
 
 // ---- Hauptschleife ----
+document.getElementById('mon').addEventListener('click',()=>{ colorMode=!colorMode; applyMonitor(); kb.focus(); });
+applyMonitor();
 let last=0;
 function loop(t){
   requestAnimationFrame(loop);
