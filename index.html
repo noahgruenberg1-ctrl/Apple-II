@@ -107,7 +107,7 @@ function peekMem(a){
   if(a>=0xC000&&a<0xC100){
     const s=a&0xF0;
     if(s===0x00) return kbd;
-    if(s===0x10){ const v=kbd&0x7F; clearStrobe(); return v; }
+    if(s===0x10){ const v=kbd&0x7F; kq.length=0; kbd&=0x7F; return v; }   // wie Original: Tastatur komplett leeren
     if(s===0x30){ toggle(); return 0; }
     if(s===0x50){ sw(a&15); return 0; }
     return 0;
